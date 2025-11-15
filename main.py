@@ -1,11 +1,13 @@
 """
 Enhanced ORCA-HORIZON API with SMTP verification and web scraping enrichment
-Version: 0.3.0
+Version: 0.4.0 - Now with Built-in Monitoring & Analytics (No Third-Party Tools!)
 Author: Suresh Ginjupalli
 """
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
+from starlette.middleware.base import BaseHTTPMiddleware
 import re
 import dns.resolver
 import socket
@@ -14,19 +16,276 @@ import httpx
 from bs4 import BeautifulSoup
 import hashlib
 import json
-from datetime import datetime
-from typing import Dict, Optional, List
+from datetime import datetime, timedelta
+from typing import Dict, Optional, List, Any
+from collections import defaultdict, deque
 import asyncio
 import time
 import random
 from functools import lru_cache
+import threading
+import os
+from pathlib import Path
+
+# =============================================================================
+# BUILT-IN MONITORING & ANALYTICS SYSTEM (No Redis/Prometheus needed!)
+# =============================================================================
+
+class MetricsCollector:
+    """
+    Built-in metrics tracking system - replaces Prometheus
+    Uses only Python stdlib - no third-party dependencies!
+    """
+    def __init__(self, max_history=10000):
+        self.max_history = max_history
+        self.request_count = 0
+        self.request_latencies = deque(maxlen=max_history)
+        self.endpoint_metrics = defaultdict(lambda: {
+            'count': 0,
+            'total_time': 0.0,
+            'errors': 0,
+            'success': 0
+        })
+        self.status_codes = defaultdict(int)
+        self.hourly_stats = defaultdict(int)
+        self.daily_stats = defaultdict(int)
+        self.lock = threading.Lock()
+        self.start_time = datetime.utcnow()
+
+        # Email validation specific metrics
+        self.validation_stats = {
+            'total_validated': 0,
+            'valid_emails': 0,
+            'invalid_emails': 0,
+            'disposable_found': 0,
+            'smtp_verified': 0,
+            'enriched': 0
+        }
+
+    def record_request(self, endpoint: str, method: str, status_code: int, duration: float):
+        """Record request metrics"""
+        with self.lock:
+            self.request_count += 1
+            self.request_latencies.append(duration)
+            self.status_codes[status_code] += 1
+
+            key = f"{method} {endpoint}"
+            self.endpoint_metrics[key]['count'] += 1
+            self.endpoint_metrics[key]['total_time'] += duration
+
+            if 200 <= status_code < 300:
+                self.endpoint_metrics[key]['success'] += 1
+            else:
+                self.endpoint_metrics[key]['errors'] += 1
+
+            # Time-based stats
+            now = datetime.utcnow()
+            hour_key = now.strftime('%Y-%m-%d %H:00')
+            day_key = now.strftime('%Y-%m-%d')
+            self.hourly_stats[hour_key] += 1
+            self.daily_stats[day_key] += 1
+
+    def record_validation(self, valid: bool, disposable: bool, smtp_verified: bool):
+        """Record email validation metrics"""
+        with self.lock:
+            self.validation_stats['total_validated'] += 1
+            if valid:
+                self.validation_stats['valid_emails'] += 1
+            else:
+                self.validation_stats['invalid_emails'] += 1
+            if disposable:
+                self.validation_stats['disposable_found'] += 1
+            if smtp_verified:
+                self.validation_stats['smtp_verified'] += 1
+
+    def record_enrichment(self):
+        """Record enrichment request"""
+        with self.lock:
+            self.validation_stats['enriched'] += 1
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current metrics snapshot"""
+        with self.lock:
+            uptime = (datetime.utcnow() - self.start_time).total_seconds()
+
+            # Calculate percentiles
+            sorted_latencies = sorted(self.request_latencies)
+            p50 = sorted_latencies[len(sorted_latencies)//2] if sorted_latencies else 0
+            p95 = sorted_latencies[int(len(sorted_latencies)*0.95)] if sorted_latencies else 0
+            p99 = sorted_latencies[int(len(sorted_latencies)*0.99)] if sorted_latencies else 0
+            avg_latency = sum(self.request_latencies) / len(self.request_latencies) if self.request_latencies else 0
+
+            return {
+                'uptime_seconds': uptime,
+                'total_requests': self.request_count,
+                'requests_per_second': self.request_count / uptime if uptime > 0 else 0,
+                'latency_ms': {
+                    'avg': round(avg_latency * 1000, 2),
+                    'p50': round(p50 * 1000, 2),
+                    'p95': round(p95 * 1000, 2),
+                    'p99': round(p99 * 1000, 2)
+                },
+                'status_codes': dict(self.status_codes),
+                'endpoints': {
+                    k: {
+                        'requests': v['count'],
+                        'avg_time_ms': round((v['total_time'] / v['count'] * 1000), 2) if v['count'] > 0 else 0,
+                        'success_rate': round((v['success'] / v['count'] * 100), 2) if v['count'] > 0 else 0,
+                        'errors': v['errors']
+                    }
+                    for k, v in self.endpoint_metrics.items()
+                },
+                'validation_stats': dict(self.validation_stats),
+                'last_hour_requests': dict(list(self.hourly_stats.items())[-24:]),
+                'daily_requests': dict(list(self.daily_stats.items())[-30:])
+            }
+
+    def save_to_file(self, filepath: str = 'metrics.json'):
+        """Persist metrics to file"""
+        try:
+            metrics = self.get_metrics()
+            metrics['timestamp'] = datetime.utcnow().isoformat()
+            with open(filepath, 'w') as f:
+                json.dump(metrics, f, indent=2)
+        except Exception as e:
+            print(f"Error saving metrics: {e}")
+
+
+class EnhancedCache:
+    """
+    Enhanced caching system with TTL and size limits
+    Replaces Redis - uses only Python stdlib!
+    """
+    def __init__(self, max_size=1000, default_ttl=3600):
+        self.cache = {}
+        self.timestamps = {}
+        self.access_count = {}
+        self.max_size = max_size
+        self.default_ttl = default_ttl
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str) -> Optional[Any]:
+        """Get item from cache"""
+        with self.lock:
+            if key not in self.cache:
+                self.misses += 1
+                return None
+
+            # Check if expired
+            if time.time() - self.timestamps[key] > self.default_ttl:
+                del self.cache[key]
+                del self.timestamps[key]
+                if key in self.access_count:
+                    del self.access_count[key]
+                self.misses += 1
+                return None
+
+            self.hits += 1
+            self.access_count[key] = self.access_count.get(key, 0) + 1
+            return self.cache[key]
+
+    def set(self, key: str, value: Any, ttl: Optional[int] = None):
+        """Set item in cache"""
+        with self.lock:
+            # Evict if at max size
+            if len(self.cache) >= self.max_size and key not in self.cache:
+                # Remove least recently used
+                lru_key = min(self.access_count.items(), key=lambda x: x[1])[0]
+                del self.cache[lru_key]
+                del self.timestamps[lru_key]
+                del self.access_count[lru_key]
+
+            self.cache[key] = value
+            self.timestamps[key] = time.time()
+            self.access_count[key] = 0
+
+    def clear_expired(self):
+        """Clear all expired items"""
+        with self.lock:
+            current_time = time.time()
+            expired_keys = [
+                k for k, t in self.timestamps.items()
+                if current_time - t > self.default_ttl
+            ]
+            for key in expired_keys:
+                del self.cache[key]
+                del self.timestamps[key]
+                if key in self.access_count:
+                    del self.access_count[key]
+
+    def get_stats(self) -> Dict:
+        """Get cache statistics"""
+        with self.lock:
+            total_requests = self.hits + self.misses
+            hit_rate = (self.hits / total_requests * 100) if total_requests > 0 else 0
+            return {
+                'size': len(self.cache),
+                'max_size': self.max_size,
+                'hits': self.hits,
+                'misses': self.misses,
+                'hit_rate': round(hit_rate, 2),
+                'total_requests': total_requests
+            }
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """
+    Request/Response logging and metrics collection middleware
+    """
+    def __init__(self, app, metrics_collector: MetricsCollector):
+        super().__init__(app)
+        self.metrics = metrics_collector
+
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+
+        # Process request
+        response = await call_next(request)
+
+        # Calculate duration
+        duration = time.time() - start_time
+
+        # Record metrics
+        self.metrics.record_request(
+            endpoint=request.url.path,
+            method=request.method,
+            status_code=response.status_code,
+            duration=duration
+        )
+
+        # Add custom headers with metrics
+        response.headers['X-Response-Time'] = f"{duration*1000:.2f}ms"
+
+        return response
+
+
+# Initialize global instances
+metrics_collector = MetricsCollector()
+enhanced_cache = EnhancedCache(max_size=2000, default_ttl=1800)  # 30 min TTL
+
+# Background task to save metrics periodically
+async def periodic_metrics_save():
+    """Save metrics every 5 minutes"""
+    while True:
+        await asyncio.sleep(300)  # 5 minutes
+        metrics_collector.save_to_file('data/metrics.json')
+        enhanced_cache.clear_expired()
+
+# =============================================================================
+# FASTAPI APP INITIALIZATION
+# =============================================================================
 
 app = FastAPI(
     title="ORCA-HORIZON API",
-    description="AI-powered lead intelligence for sales teams",
-    version="0.3.0",
+    description="AI-powered lead intelligence with built-in monitoring - No Redis/Prometheus!",
+    version="0.4.0",
     docs_url="/docs"
 )
+
+# Add request logging middleware
+app.add_middleware(RequestLoggingMiddleware, metrics_collector=metrics_collector)
 
 # Enable CORS
 app.add_middleware(
@@ -35,6 +294,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Initialize on startup"""
+    # Create data directory for metrics persistence
+    Path("data").mkdir(exist_ok=True)
+
+    # Start background task for periodic metrics saving
+    asyncio.create_task(periodic_metrics_save())
+
+    print("✓ ORCA-HORIZON v0.4.0 started")
+    print("✓ Built-in monitoring active (No Redis/Prometheus!)")
+    print("✓ Enhanced caching enabled")
+    print("✓ Metrics will be saved to data/metrics.json")
 
 # =============================================================================
 # CONFIGURATION & CONSTANTS
@@ -464,10 +738,16 @@ def root():
     return {
         "name": "ORCA-HORIZON",
         "status": "operational",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "author": "Suresh Ginjupalli",
         "github": "https://github.com/SureshJohnWesly99/Orca-Horizon",
-        "description": "AI-powered lead intelligence for sales teams"
+        "description": "AI-powered lead intelligence for sales teams",
+        "features": [
+            "Built-in monitoring (No Prometheus!)",
+            "Enhanced caching (No Redis!)",
+            "Request logging & analytics",
+            "100% license-free dependencies"
+        ]
     }
 
 @app.post("/api/validate")
@@ -475,14 +755,20 @@ def validate_email(request: EmailValidationRequest):
     """Enhanced 4-layer email validation with catch-all detection"""
     email = request.email.lower()
     domain = email.split('@')[1]
-    
+
+    # Check cache first
+    cache_key = f"validate:{email}"
+    cached_result = enhanced_cache.get(cache_key)
+    if cached_result:
+        return cached_result
+
     # Layer 1: Syntax validation
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     valid_syntax = bool(re.match(pattern, email))
-    
+
     # Layer 2: Disposable check
     is_disposable = domain in DISPOSABLE_DOMAINS
-    
+
     # Layer 3: MX record check
     has_mx = False
     try:
@@ -490,12 +776,12 @@ def validate_email(request: EmailValidationRequest):
         has_mx = True
     except:
         has_mx = False
-    
+
     # Layer 4: Reachability check (SMTP)
     reachability = check_email_reachability(email)
     is_reachable = reachability.get('reachable')
     is_catch_all = reachability.get('is_catch_all', False)
-    
+
     # Calculate comprehensive score
     score = 0
     if valid_syntax:
@@ -504,7 +790,7 @@ def validate_email(request: EmailValidationRequest):
         score += 25
     if has_mx:
         score += 25
-    
+
     # Better scoring based on SMTP results
     if is_reachable == True:
         if is_catch_all:
@@ -513,8 +799,8 @@ def validate_email(request: EmailValidationRequest):
             score += 25  # Full score for verified
     elif is_reachable is None:
         score += 10  # Unknown is better than invalid
-    
-    return {
+
+    result = {
         "email": email,
         "valid": valid_syntax and has_mx,
         "reachable": is_reachable,
@@ -526,11 +812,32 @@ def validate_email(request: EmailValidationRequest):
         "verification_details": reachability
     }
 
+    # Record metrics
+    metrics_collector.record_validation(
+        valid=result['valid'],
+        disposable=is_disposable,
+        smtp_verified=is_reachable == True
+    )
+
+    # Cache result
+    enhanced_cache.set(cache_key, result, ttl=1800)  # Cache for 30 min
+
+    return result
+
 @app.post("/api/enrich", response_model=EnrichedResponse)
 async def enrich_email(request: EmailValidationRequest):
     """
     Enhanced enrichment with better company data extraction
     """
+    # Record enrichment metric
+    metrics_collector.record_enrichment()
+
+    # Check cache first
+    cache_key = f"enrich:{request.email.lower()}"
+    cached_result = enhanced_cache.get(cache_key)
+    if cached_result:
+        return cached_result
+
     # First validate with the improved function
     validation = validate_email(request)
     
@@ -619,15 +926,83 @@ async def enrich_email(request: EmailValidationRequest):
     if not enriched_data.get('company_name') and domain not in TRUSTED_PROVIDERS:
         enriched_data['company_name'] = domain.replace('.com', '').replace('-', ' ').title()
         enriched_data['company_website'] = f"https://{domain}"
-    
+
+    # Cache enriched result
+    enhanced_cache.set(cache_key, enriched_data, ttl=3600)  # Cache for 1 hour
+
     return enriched_data
 
 @app.get("/health")
 def health_check():
+    """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/metrics")
+def get_metrics():
+    """
+    Get comprehensive API metrics - replaces Prometheus!
+    Returns detailed performance and usage analytics
+    """
+    return {
+        "metrics": metrics_collector.get_metrics(),
+        "cache": enhanced_cache.get_stats(),
+        "system": {
+            "version": "0.4.0",
+            "monitoring": "built-in (no Prometheus)",
+            "caching": "enhanced in-memory (no Redis)"
+        }
+    }
+
+@app.get("/api/stats")
+def get_api_stats():
+    """Get simplified API statistics"""
+    metrics = metrics_collector.get_metrics()
+    cache_stats = enhanced_cache.get_stats()
+
+    return {
+        "summary": {
+            "total_requests": metrics['total_requests'],
+            "uptime_hours": round(metrics['uptime_seconds'] / 3600, 2),
+            "requests_per_second": round(metrics['requests_per_second'], 2),
+            "avg_response_time_ms": metrics['latency_ms']['avg'],
+            "cache_hit_rate": cache_stats['hit_rate']
+        },
+        "email_validation": {
+            "total_validated": metrics['validation_stats']['total_validated'],
+            "valid_emails": metrics['validation_stats']['valid_emails'],
+            "success_rate": round(
+                (metrics['validation_stats']['valid_emails'] /
+                 metrics['validation_stats']['total_validated'] * 100)
+                if metrics['validation_stats']['total_validated'] > 0 else 0,
+                2
+            ),
+            "smtp_verified": metrics['validation_stats']['smtp_verified'],
+            "enriched": metrics['validation_stats']['enriched']
+        },
+        "performance": {
+            "p50_ms": metrics['latency_ms']['p50'],
+            "p95_ms": metrics['latency_ms']['p95'],
+            "p99_ms": metrics['latency_ms']['p99']
+        }
+    }
+
+@app.get("/api/cache/stats")
+def get_cache_stats():
+    """Get detailed cache statistics"""
+    return enhanced_cache.get_stats()
+
+@app.post("/api/cache/clear")
+def clear_cache():
+    """Clear all expired cache entries"""
+    enhanced_cache.clear_expired()
+    return {
+        "status": "success",
+        "message": "Expired cache entries cleared",
+        "current_stats": enhanced_cache.get_stats()
     }
 
 # =============================================================================
