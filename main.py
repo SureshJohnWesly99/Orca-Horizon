@@ -3,7 +3,6 @@ ORCA-HORIZON: AI-Powered Lead Intelligence
 Author: Suresh Ginjupalli
 Portfolio Project
 """
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -64,3 +63,11 @@ def validate_email(request: EmailValidationRequest):
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+    
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
